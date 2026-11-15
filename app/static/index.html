@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>宽表→长表在线迁移控制台</title>
+<style>
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: #f4f6fa; color: #1f2937; }
+  header { background: #0f3d5c; color: #fff; padding: 14px 24px; }
+  header h1 { margin: 0; font-size: 18px; }
+  main { max-width: 1100px; margin: 20px auto; padding: 0 16px; display: grid;
+         grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card { background: #fff; border-radius: 10px; padding: 16px 18px;
+          box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  .card.full { grid-column: 1 / -1; }
+  h2 { font-size: 15px; margin: 0 0 10px; color: #0f3d5c; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border: 1px solid #e5e7eb; padding: 5px 8px; text-align: left; }
+  th { background: #f0f4f8; }
+  button { cursor: pointer; border: 0; border-radius: 6px; padding: 7px 12px;
+           font-size: 13px; margin: 2px 4px 2px 0; }
+  .primary { background: #1d6fa5; color: #fff; }
+  .warn { background: #b45309; color: #fff; }
+  .danger { background: #b91c1c; color: #fff; }
+  .ghost { background: #e5e7eb; color: #111827; }
+  input { padding: 6px 8px; border: 1px solid #cbd5e1; border-radius: 6px;
+          width: 90px; font-size: 13px; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 999px;
+           font-size: 12px; font-weight: 600; }
+  .phase-init, .phase-paused { background: #fef3c7; color: #92400e; }
+  .phase-backfilling, .phase-switching { background: #dbeafe; color: #1e40af; }
+  .phase-ready { background: #dcfce7; color: #166534; }
+  .phase-switched { background: #ede9fe; color: #5b21b6; }
+  pre { background: #0b1220; color: #d1e7ff; padding: 10px; border-radius: 8px;
+        font-size: 12px; overflow:auto; max-height: 220px; }
+  .muted { color: #6b7280; font-size: 12px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>samples(temp, ph) 宽表 → measurements(sample_id, metric, value) 长表 · 在线迁移</h1>
+</header>
+<main>
+  <section class="card full">
+    <h2>迁移控制</h2>
+    <p>当前阶段：<span id="phase" class="badge">…</span>
+       <span id="watermark" class="muted"></span>
+       <span id="consistency" class="muted"></span></p>
+    <p>
+      <button class="primary" onclick="act('migration/start')">启动回填</button>
+      <button class="warn" onclick="act('migration/pause')">暂停</button>
+      <button class="ghost" onclick="act('migration/resume')">续办</button>
+      <button class="primary" onclick="act('migration/switch')">最终切换</button>
+      <button class="danger" onclick="act('migration/switch?hold_seconds=5')">
+        演示：切换中退出(持锁5s后回滚)</button>
+    </p>
+    <p class="muted">切换是全程唯一一次短暂阻塞写入；演示按钮会在排他锁内回滚，
+       模拟进程崩溃，刷新后可看到阶段自动回到 ready，旧接口不受影响。</p>
+  </section>
+
+  <section class="card">
+    <h2>旧入口 /samples（宽表语义，切换后为同名视图）</h2>
+    <form onsubmit="return postSample(event)">
+      <input name="temp" placeholder="temp" required>
+      <input name="ph" placeholder="ph" required>
+      <button class="primary" type="submit">新增样本</button>
+    </form>
+    <table><thead><tr><th>id</th><th>temp</th><th>ph</th><th>操作</th></tr></thead>
+      <tbody id="samples"></tbody></table>
+  </section>
+
+  <section class="card">
+    <h2>新入口 /measurements（指标长表，每样本恰两项）</h2>
+    <table><thead><tr><th>sample_id</th><th>metric</th><th>value</th></tr></thead>
+      <tbody id="measurements"></tbody></table>
+  </section>
+
+  <section class="card full">
+    <h2>操作日志</h2>
+    <pre id="log"></pre>
+  </section>
+</main>
+
+<script>
+const log = (msg) => {
+  const el = document.getElementById('log');
+  el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}\n` + el.textContent;
+};
+async function api(path, opts) {
+  const r = await fetch('/' + path, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.detail || r.statusText);
+  return data;
+}
+async function act(path) {
+  try { log('POST ' + path + ' → ' + JSON.stringify(await api(path, {method:'POST'}))); }
+  catch (e) { log('ERROR ' + path + ' → ' + e.message); }
+  refresh();
+}
+async function postSample(ev) {
+  ev.preventDefault();
+  const f = ev.target;
+  try {
+    await api('samples', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({temp: +f.temp.value, ph: +f.ph.value})});
+    log(`新增样本 temp=${f.temp.value} ph=${f.ph.value}`);
+    f.reset();
+  } catch (e) { log(e.message); }
+  refresh();
+  return false;
+}
+async function editSample(id) {
+  const temp = prompt('新的 temp 值'); if (temp === null) return;
+  const ph = prompt('新的 ph 值'); if (ph === null) return;
+  try {
+    await api(`samples/${id}`, {method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({temp: +temp, ph: +ph})});
+    log(`样本 ${id} 两项一起更新为 temp=${temp}, ph=${ph}`);
+  } catch (e) { log(e.message); }
+  refresh();
+}
+async function delSample(id) {
+  if (!confirm(`删除样本 ${id}（整组两项一起删）？`)) return;
+  try { await api(`samples/${id}`, {method:'DELETE'}); log(`删除样本 ${id}`); }
+  catch (e) { log(e.message); }
+  refresh();
+}
+function esc(s){return String(s).replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+
+async function refresh() {
+  try {
+    const p = await api('migration/progress');
+    const badge = document.getElementById('phase');
+    badge.textContent = p.state;
+    badge.className = 'badge phase-' + p.state;
+    document.getElementById('watermark').textContent =
+      ` 水位 last_id=${p.last_id} · 宽表行=${p.sample_count} · ` +
+      `长表组=${p.measured_samples} · 长表行=${p.measurement_rows}`;
+    const c = p.consistency;
+    document.getElementById('consistency').textContent =
+      ` 一致性校验: ${c.ok ? '通过' : '失败'} ` +
+      `(不匹配=${c.mismatches}, 基数错误=${c.bad_cardinality})`;
+
+    const samples = await api('samples');
+    document.getElementById('samples').innerHTML = samples.map(s =>
+      `<tr><td>${s.id}</td><td>${s.temp}</td><td>${s.ph}</td>
+       <td><button class="ghost" onclick="editSample(${s.id})">改</button>
+           <button class="danger" onclick="delSample(${s.id})">删</button></td></tr>`).join('')
+      || '<tr><td colspan="4" class="muted">无数据</td></tr>';
+
+    const meas = await api('measurements');
+    document.getElementById('measurements').innerHTML = meas.map(m =>
+      `<tr><td>${m.sample_id}</td><td>${esc(m.metric)}</td><td>${m.value}</td></tr>`
+    ).join('') || '<tr><td colspan="3" class="muted">无数据</td></tr>';
+  } catch (e) { log('刷新失败: ' + e.message); }
+}
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

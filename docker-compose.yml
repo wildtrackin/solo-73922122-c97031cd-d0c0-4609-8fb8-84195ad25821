@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: warehouse
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d warehouse"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    environment:
+      # 旧采集程序与本服务共用同一个 DSN，对 samples 的直接 SQL 全程有效
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/warehouse
+      BACKFILL_BATCH_SIZE: "5"
+      BACKFILL_IDLE_SECONDS: "0.3"
+      # 演示“切换中进程退出”：>0 时切换事务在持锁阶段 sleep 后回滚（模拟崩溃）
+      SWITCH_HOLD_SECONDS: "0"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

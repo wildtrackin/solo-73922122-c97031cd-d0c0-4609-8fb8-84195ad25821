@@ -1,0 +1,8 @@
+# 演示用覆盖配置：小批次便于观察进度，并开启崩溃演示端点
+# 用法：docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d
+services:
+  api:
+    environment:
+      BACKFILL_BATCH_SIZE: "2"
+      BACKFILL_IDLE_SECONDS: "0.4"
+      ALLOW_CRASH_DEMO: "1"
