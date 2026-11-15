@@ -46,7 +46,7 @@ def _ensure_database():
         if not exists:
             admin.execute(f"CREATE DATABASE {TEST_DB}")
     os.environ["DATABASE_URL"] = dsn
-    os.environ.setdefault("BACKFILL_BATCH_SIZE", "3")
+    os.environ.setdefault("BACKFILL_BATCH_SIZE", "1")
     os.environ.setdefault("BACKFILL_IDLE_SECONDS", "0.1")
     yield
 

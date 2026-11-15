@@ -2,12 +2,13 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+import psycopg
 from psycopg.errors import CheckViolation, UniqueViolation
 from psycopg.rows import dict_row
 
-from . import crud, db, migration
+from . import crud, db, merge, migration
 from .db import lifespan
-from .schemas import SampleIn
+from .schemas import MergeIn, SampleIn
 
 app = FastAPI(
     title="宽表 -> 指标长表在线迁移控制台",
@@ -56,6 +57,61 @@ def migration_switch(hold_seconds: float | None = None):
     if not result["ok"]:
         raise HTTPException(status_code=409, detail=result["detail"])
     return result
+
+
+# ------------------------------------------------ 样本合并（切换前均可操作）
+@app.get("/samples/{sample_id}/merge-preview")
+def merge_preview(sample_id: int, duplicate_id: int):
+    """网页选择前的数值预览：读当前已提交的两条记录，不做任何写入。"""
+    with db.pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            rows = {}
+            for sid in (sample_id, duplicate_id):
+                cur.execute("SELECT id, temp, ph FROM samples WHERE id = %s", (sid,))
+                row = cur.fetchone()
+                if row is not None:
+                    rows[sid] = dict(row)
+            phase = migration.get_phase(conn)
+            cur.execute(
+                "SELECT sample_id, metric, value FROM measurements "
+                "WHERE sample_id = ANY(%s) ORDER BY sample_id, metric",
+                ([sample_id, duplicate_id],),
+            )
+            measurements = [dict(r) for r in cur.fetchall()]
+    return {
+        "keep_id": sample_id,
+        "duplicate_id": duplicate_id,
+        "phase": phase,
+        "mergeable": phase in merge.ALLOWED_PHASES,
+        "samples": rows,
+        "missing": [sid for sid in (sample_id, duplicate_id) if sid not in rows],
+        "measurements": measurements,
+    }
+
+
+@app.post("/samples/merge")
+def samples_merge(body: MergeIn):
+    """原子合并：从两条当前已提交记录取值，更新保留样本、删除重复样本。"""
+    with db.pool.connection() as conn:
+        try:
+            return merge.merge_samples(
+                conn, body.keep_id, body.duplicate_id,
+                body.temp_from, body.ph_from,
+            )
+        except merge.MergeError as exc:
+            conn.rollback()
+            raise HTTPException(status_code=409, detail=exc.as_detail()) from exc
+        except psycopg.errors.DeadlockDetected as exc:
+            # 与旧程序多行写入的锁顺序冲突：PostgreSQL 已回滚整个事务，
+            # 合并未产生任何部分写入，安全重试即可。
+            conn.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "conflict_retry",
+                        "message": f"deadlock with concurrent writer; "
+                                   f"merge rolled back: {exc}",
+                        "missing": []},
+            ) from exc
 
 
 # ------------------------------------------------ 旧入口：宽表 samples

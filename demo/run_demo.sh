@@ -7,6 +7,8 @@
 #      —— 均不被旧扫描覆盖或复活
 #   C. 进程被 kill -9 后重启，迁移自动续办，无半迁移
 #   D. 一次修改两项的原子性（约束失败整体回滚）
+#   D2. 同一送检样本两个编号合并：按选择取当前已提交值，原子更新+删除，
+#       任一编号不存在则整次失败
 #   E. 切换中进程退出（持锁 3s 后回滚）：旧接口继续可用，可重新切换
 #   F. 最终切换：samples 变同名视图，SELECT/增改删 全部保留，
 #      新旧入口读写同一份数据，每样本恰两项
@@ -89,6 +91,37 @@ curl -s -X PUT "$BASE_URL/measurements/3" -H 'Content-Type: application/json' \
      -d '{"temp": 60.01, "ph": 6.02}' >/dev/null
 say "新入口 PUT /measurements/3 后：$($PSQL -c \
    "SELECT string_agg(metric||'='||value,',' ORDER BY metric) FROM measurements WHERE sample_id=3;")"
+
+step "D2. 同一送检样本被记成两个编号：合并（回填/切换前均可操作）"
+# 旧采集程序重复登记：同一份送检样本拿到两个编号
+$PSQL -c "INSERT INTO samples (temp, ph) VALUES (51.10, 6.11);" >/dev/null
+KEEP=$($PSQL -c "SELECT max(id) FROM samples;")
+$PSQL -c "INSERT INTO samples (temp, ph) VALUES (52.20, 6.22);" >/dev/null
+DUP=$($PSQL -c "SELECT max(id) FROM samples;")
+say "保留编号=$KEEP(51.10/6.11)，重复编号=$DUP(52.20/6.22)"
+curl -s "$BASE_URL/samples/$KEEP/merge-preview?duplicate_id=$DUP" >/dev/null
+BEFORE_KEEP=$($PSQL -c "SELECT temp||'/'||ph FROM samples WHERE id=$KEEP;")
+BEFORE_DUP=$($PSQL -c "SELECT temp||'/'||ph FROM samples WHERE id=$DUP;")
+M=$(curl -s -X POST "$BASE_URL/samples/merge" -H 'Content-Type: application/json' \
+     -d "{\"keep_id\":$KEEP,\"duplicate_id\":$DUP,\"temp_from\":\"duplicate\",\"ph_from\":\"keep\"}")
+echo "$M" | python3 -m json.tool
+say "合并前：保留=$BEFORE_KEEP，重复=$BEFORE_DUP"
+V=$($PSQL -c "SELECT temp||'/'||ph FROM samples WHERE id=$KEEP;")
+[ "$V" = "52.20/6.11" ] && ok "原子合并：温度取重复编号、pH 取保留编号，合并后=$V"
+[ "$($PSQL -c "SELECT count(*) FROM samples WHERE id=$DUP;")" = "0" ] \
+  && ok "重复编号已从宽表删除"
+[ "$($PSQL -c "SELECT count(*) FROM measurements WHERE sample_id=$DUP;")" = "0" ] \
+  && ok "重复编号的两项指标已从长表一并清理（不会复活）"
+[ "$($PSQL -c "SELECT count(*) FROM measurements WHERE sample_id=$KEEP;")" = "2" ] \
+  && ok "保留编号恰好两项指标"
+# 任一编号已不存在 -> 整次失败（保留编号保持原值）
+BEFORE=$($PSQL -c "SELECT temp||'/'||ph FROM samples WHERE id=$KEEP;")
+CODE=$(curl -s -o /tmp/merge_missing.json -w '%{http_code}' \
+  -X POST "$BASE_URL/samples/merge" -H 'Content-Type: application/json' \
+  -d "{\"keep_id\":$KEEP,\"duplicate_id\":$DUP,\"temp_from\":\"keep\",\"ph_from\":\"keep\"}")
+[ "$CODE" = "409" ] && ok "重复编号已不存在：合并返回 409，整次失败"
+[ "$($PSQL -c "SELECT temp||'/'||ph FROM samples WHERE id=$KEEP;")" = "$BEFORE" ] \
+  && ok "失败时保留编号毫发无损（无部分写入）"
 
 step "E. 切换中进程退出：持锁 5s 后回滚（模拟崩溃）"
 # 后台发起“会回滚的切换”。切换事务持有 ACCESS EXCLUSIVE 锁期间，

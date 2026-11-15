@@ -35,6 +35,14 @@
         font-size: 12px; overflow:auto; max-height: 220px; }
   .muted { color: #6b7280; font-size: 12px; }
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .merge-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+  .merge-row label { display: flex; flex-direction: column; gap: 4px; font-size: 12px;
+                     color: #4b5563; }
+  .merge-row input, .merge-row select { width: 110px; }
+  .radio { display: flex; gap: 8px; align-items: center; font-size: 13px; }
+  .ok { color: #166534; font-weight: 600; }
+  .err { color: #b91c1c; font-weight: 600; }
+  .num { font-variant-numeric: tabular-nums; }
   @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -78,6 +86,36 @@
   </section>
 
   <section class="card full">
+    <h2>样本合并（同一送检样本被记成两个编号 · 最终切换前可用）</h2>
+    <div class="merge-row">
+      <label>保留编号
+        <input id="m_keep" type="number" min="1" placeholder="如 3" oninput="previewMerge()">
+      </label>
+      <label>重复编号
+        <input id="m_dup" type="number" min="1" placeholder="如 7" oninput="previewMerge()">
+      </label>
+      <label>温度取自
+        <select id="m_temp_from" onchange="renderMergePreview()">
+          <option value="keep">保留编号</option>
+          <option value="duplicate">重复编号</option>
+        </select>
+      </label>
+      <label>pH 取自
+        <select id="m_ph_from" onchange="renderMergePreview()">
+          <option value="keep">保留编号</option>
+          <option value="duplicate">重复编号</option>
+        </select>
+      </label>
+      <button class="primary" id="m_submit" onclick="doMerge()">提交合并</button>
+      <button class="ghost" onclick="previewMerge()">刷新两条记录</button>
+    </div>
+    <p class="muted">服务端在事务内锁定两行后，按上面的选择从两条<b>当前已提交</b>记录取值：
+       更新保留编号、删除重复编号（长表两项一并清理），任一编号不存在则整次失败。</p>
+    <div id="merge_preview"></div>
+    <div id="merge_result"></div>
+  </section>
+
+  <section class="card full">
     <h2>操作日志</h2>
     <pre id="log"></pre>
   </section>
@@ -91,7 +129,12 @@ const log = (msg) => {
 async function api(path, opts) {
   const r = await fetch('/' + path, opts);
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.detail || r.statusText);
+  if (!r.ok) {
+    const d = data.detail;
+    const msg = d == null ? r.statusText
+      : (typeof d === 'string' ? d : (d.message || JSON.stringify(d)));
+    throw new Error(msg);
+  }
   return data;
 }
 async function act(path) {
@@ -130,6 +173,135 @@ async function delSample(id) {
 function esc(s){return String(s).replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
+// ---------------------------------------------------------------- 样本合并
+let mergePreviewData = null;
+
+function mergeIds() {
+  const keep = parseInt(document.getElementById('m_keep').value, 10);
+  const dup = parseInt(document.getElementById('m_dup').value, 10);
+  return {keep, dup};
+}
+
+async function previewMerge() {
+  const {keep, dup} = mergeIds();
+  const box = document.getElementById('merge_preview');
+  mergePreviewData = null;
+  if (!(keep > 0) || !(dup > 0)) {
+    box.innerHTML = '<p class="muted">输入保留编号与重复编号后显示当前数值。</p>';
+    return;
+  }
+  try {
+    mergePreviewData = await api(
+      `samples/${keep}/merge-preview?duplicate_id=${dup}`);
+    renderMergePreview();
+  } catch (e) {
+    box.innerHTML = `<p class="err">预览失败：${esc(e.message)}</p>`;
+  }
+}
+
+function valueCell(row, metric) {
+  if (!row) return '<span class="err">已不存在</span>';
+  return `<span class="num">${esc(row[metric])}</span>`;
+}
+
+function renderMergePreview() {
+  const el = document.getElementById('merge_preview');
+  const d = mergePreviewData;
+  if (!d) return;
+  const k = d.samples[d.keep_id], q = d.samples[d.duplicate_id];
+  const tempFrom = document.getElementById('m_temp_from').value;
+  const phFrom = document.getElementById('m_ph_from').value;
+  const pick = (metric, src) => src === 'keep' ? k : q;
+  const chosenTemp = pick('temp', tempFrom);
+  const chosenPh = pick('ph', phFrom);
+
+  const note = d.phase === 'switched'
+    ? '<span class="err">已切换：samples 已是视图，不能再合并。</span>'
+    : `<span class="muted">当前阶段 ${esc(d.phase)}，可合并。</span>`;
+
+  el.innerHTML = `
+    <table>
+      <thead><tr><th>编号</th><th>角色</th><th>temp</th><th>ph</th><th>长表指标</th></tr></thead>
+      <tbody>
+        <tr><td>${d.keep_id}</td><td>保留</td>
+            <td>${valueCell(k, 'temp')} ${tempFrom==='keep'?'✅':''}</td>
+            <td>${valueCell(k, 'ph')} ${phFrom==='keep'?'✅':''}</td>
+            <td class="num">${esc(groupText(d.measurements, d.keep_id))}</td></tr>
+        <tr><td>${d.duplicate_id}</td><td>重复</td>
+            <td>${valueCell(q, 'temp')} ${tempFrom==='duplicate'?'✅':''}</td>
+            <td>${valueCell(q, 'ph')} ${phFrom==='duplicate'?'✅':''}</td>
+            <td class="num">${esc(groupText(d.measurements, d.duplicate_id))}</td></tr>
+      </tbody>
+    </table>
+    <p>合并后保留编号 <b>${d.keep_id}</b> 的数值：
+       <span class="num">temp=${esc(chosenTemp ? chosenTemp.temp : '—')},
+       ph=${esc(chosenPh ? chosenPh.ph : '—')}</span>；重复编号
+       <b>${d.duplicate_id}</b> 将被删除。</p>
+    <p>${note}
+       ${d.missing.length ? `<span class="err">编号 ${d.missing.join('、')} 已不存在，提交会整次失败。</span>` : ''}</p>`;
+}
+
+function groupText(measurements, sid) {
+  const rows = measurements.filter(m => m.sample_id === sid)
+    .map(m => `${m.metric}=${m.value}`);
+  return rows.length ? rows.join(', ') : '（无长表行）';
+}
+
+async function doMerge() {
+  const {keep, dup} = mergeIds();
+  const box = document.getElementById('merge_result');
+  if (!(keep > 0) || !(dup > 0)) {
+    box.innerHTML = '<p class="err">请填写保留编号与重复编号。</p>'; return;
+  }
+  if (keep === dup) {
+    box.innerHTML = '<p class="err">保留编号与重复编号必须不同。</p>'; return;
+  }
+  const btn = document.getElementById('m_submit');
+  btn.disabled = true;
+  box.innerHTML = '<p class="muted">提交中…（服务端锁定两行并读取当前已提交值）</p>';
+  const body = {
+    keep_id: keep,
+    duplicate_id: dup,
+    temp_from: document.getElementById('m_temp_from').value,
+    ph_from: document.getElementById('m_ph_from').value,
+  };
+  try {
+    const r = await api('samples/merge',
+      {method:'POST', headers:{'Content-Type':'application/json'},
+       body: JSON.stringify(body)});
+    box.innerHTML = `
+      <p class="ok">合并成功 ✔</p>
+      <table>
+        <thead><tr><th>编号</th><th>合并前 temp</th><th>合并前 ph</th>
+                    <th>合并后 temp</th><th>合并后 ph</th></tr></thead>
+        <tbody>
+          <tr><td>${r.keep_id}（保留）</td>
+              <td class="num">${esc(r.before.keep.temp)}</td>
+              <td class="num">${esc(r.before.keep.ph)}</td>
+              <td class="num">${esc(r.after.temp)}</td>
+              <td class="num">${esc(r.after.ph)}</td></tr>
+          <tr><td>${r.duplicate_id}（重复）</td>
+              <td class="num">${esc(r.before.duplicate.temp)}</td>
+              <td class="num">${esc(r.before.duplicate.ph)}</td>
+              <td class="err">已删除</td><td class="err">已删除</td></tr>
+        </tbody>
+      </table>
+      <p class="muted">温度取自${r.sources.temp==='keep'?'保留编号':'重复编号'}，
+          pH 取自${r.sources.ph==='keep'?'保留编号':'重复编号'}；
+          删除重复编号的长表行 ${r.removed_measurements} 条。</p>`;
+    log(`合并 ${r.duplicate_id} → ${r.keep_id}：` +
+        `before keep=${r.before.keep.temp}/${r.before.keep.ph}, ` +
+        `dup=${r.before.duplicate.temp}/${r.before.duplicate.ph}, ` +
+        `after=${r.after.temp}/${r.after.ph}`);
+  } catch (e) {
+    box.innerHTML = `<p class="err">合并失败（整次回滚）：${esc(e.message)}</p>`;
+    log(`合并失败 ${dup} → ${keep}：${e.message}`);
+  } finally {
+    btn.disabled = false;
+  }
+  refresh();
+}
+
 async function refresh() {
   try {
     const p = await api('migration/progress');
@@ -155,6 +327,12 @@ async function refresh() {
     document.getElementById('measurements').innerHTML = meas.map(m =>
       `<tr><td>${m.sample_id}</td><td>${esc(m.metric)}</td><td>${m.value}</td></tr>`
     ).join('') || '<tr><td colspan="3" class="muted">无数据</td></tr>';
+
+    if (mergePreviewData) {  // 预览中的编号若被合并/删除，刷新时同步更新
+      const {keep, dup} = mergeIds();
+      if (keep === mergePreviewData.keep_id && dup === mergePreviewData.duplicate_id)
+        await previewMerge();
+    }
   } catch (e) { log('刷新失败: ' + e.message); }
 }
 refresh();

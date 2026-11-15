@@ -20,6 +20,7 @@ from psycopg.rows import dict_row
 
 from . import db
 from .config import settings
+from .merge import MERGE_LOCK_KEY
 
 SQL_DIR = Path(__file__).resolve().parent.parent / "db" / "migrations"
 
@@ -80,12 +81,22 @@ def _set_state(cur: Cursor, state: str, last_id: int | None = None,
 
 
 def backfill_batch(cur: Cursor, batch_size: int) -> tuple[int, int]:
-    """回填一个批次，返回 (本批行数, 新水位)。
+    """回填一个批次，返回 (本批样本数, 新水位)。
 
     关键：水位以上的行才处理；UPSERT 遇到已由双写触发器写入的指标时执行
     DO UPDATE 同步当前值——直接 SQL 的最新修改胜出，旧扫描永远不会覆盖它；
     已删除的行根本不在扫描结果里，因此不会被“复活”，删除后复用的 id
     会以新行身份按当前值写入。
+
+    回填扫描对源行加 FOR SHARE（按 id 升序，与合并的 FOR UPDATE 同序）：
+    * 若旧采集程序/合并正在修改这些行，回填会等到其提交，然后 PostgreSQL
+      在 READ COMMITTED 下重检该行并按最新已提交版本取值，不会用语句开始时的
+      旧快照覆盖已提交的新值；
+    * 若合并已删除重复编号，回填在该行上等到合并提交后重新检查，发现行已
+      不存在就跳过——被删编号不会在 measurements 里复活；
+    * 合并先提交时，回填读到的是合并后的保留行数值；回填先提交时，合并
+      在回填提交后才修改，最终值仍是合并提交的值。
+    水位取本批实际写出的最大 sample_id：只推进到已处理的前缀，绝不跳过。
     """
     cur.execute("SELECT last_id FROM migration_state WHERE id=1")
     last_id = cur.fetchone()[0]
@@ -100,31 +111,25 @@ def backfill_batch(cur: Cursor, batch_size: int) -> tuple[int, int]:
         WHERE s.id > %s
         ORDER BY s.id
         LIMIT %s
+        FOR SHARE OF s
         ON CONFLICT (sample_id, metric) DO UPDATE
             SET value = EXCLUDED.value
+        RETURNING sample_id
         """,
         (last_id, batch_size * 2),
     )
-    moved = cur.rowcount // 2
+    sample_ids = [row[0] for row in cur.fetchall()]
+    moved = len(sample_ids) // 2
+    new_watermark = max(sample_ids) if sample_ids else last_id
 
-    # 水位推进到“本批处理过的最大 id”；批次为空则推进到现存最大 id，
-    # 保证删除空窗不会让回填无法结束。
-    cur.execute(
-        """
-        UPDATE migration_state
-        SET last_id = GREATEST(
-                last_id,
-                COALESCE((SELECT max(id) FROM
-                            (SELECT id FROM samples WHERE id > last_id
-                             ORDER BY id LIMIT %s) q),
-                         last_id)),
-            updated_at = now()
-        WHERE id = 1
-        RETURNING last_id
-        """,
-        (batch_size,),
-    )
-    new_watermark = cur.fetchone()[0]
+    if new_watermark != last_id:
+        # GREATEST 防止多个回填者并发时水位倒退（倒退只会引发重复扫描，但没必要）
+        cur.execute(
+            "UPDATE migration_state SET last_id=GREATEST(last_id, %s), "
+            "updated_at=now() WHERE id=1 RETURNING last_id",
+            (new_watermark,),
+        )
+        new_watermark = cur.fetchone()[0]
     return moved, new_watermark
 
 
@@ -199,10 +204,20 @@ def start_backfill(conn) -> dict:
         return {"ok": False, "detail": "already switched"}
     if phase == "backfilling":
         return {"ok": True, "detail": "already running"}
+    if phase == "switching":
+        return {"ok": False, "detail": "cannot start during final switch"}
     with conn.transaction():
-        _set_state(conn.cursor(), "backfilling",
-                   message="backfill started")
+        cur = conn.cursor()
+        # 条件更新：与并发的最终切换竞争时不得把 switching 改回 backfilling
+        cur.execute(
+            "UPDATE migration_state SET state='backfilling', message=%s, "
+            "updated_at=now() WHERE id=1 AND state IN ('init','paused','ready')",
+            ("backfill started",),
+        )
+        started = cur.rowcount > 0
     conn.commit()
+    if not started:
+        return {"ok": False, "detail": f"cannot start in phase {get_phase(conn)}"}
     _ensure_worker()
     _wake.set()
     return {"ok": True, "detail": "backfill started"}
@@ -213,8 +228,16 @@ def pause_backfill(conn) -> dict:
     if phase not in ("backfilling",):
         return {"ok": False, "detail": f"cannot pause in phase {phase}"}
     with conn.transaction():
-        _set_state(conn.cursor(), "paused", message="paused by operator")
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE migration_state SET state='paused', message=%s, updated_at=now() "
+            "WHERE id=1 AND state='backfilling'",
+            ("paused by operator",),
+        )
+        paused = cur.rowcount > 0
     conn.commit()
+    if not paused:
+        return {"ok": False, "detail": f"cannot pause in phase {get_phase(conn)}"}
     return {"ok": True, "detail": "paused"}
 
 
@@ -223,8 +246,16 @@ def resume_backfill(conn) -> dict:
     if phase not in ("paused", "init", "ready"):
         return {"ok": False, "detail": f"cannot resume in phase {phase}"}
     with conn.transaction():
-        _set_state(conn.cursor(), "backfilling", message="resumed")
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE migration_state SET state='backfilling', message=%s, "
+            "updated_at=now() WHERE id=1 AND state IN ('paused','init','ready')",
+            ("resumed",),
+        )
+        resumed = cur.rowcount > 0
     conn.commit()
+    if not resumed:
+        return {"ok": False, "detail": f"cannot resume in phase {get_phase(conn)}"}
     _ensure_worker()
     _wake.set()
     return {"ok": True, "detail": "resumed"}
@@ -281,6 +312,10 @@ def verify_consistency(conn) -> dict:
 
 
 # ---------------------------------------------------------------- 切换
+class _AlreadySwitched(Exception):
+    pass
+
+
 def perform_switch(hold_seconds: float | None = None) -> dict:
     """最终切换：全程唯一一次短暂阻塞写入。
 
@@ -307,6 +342,27 @@ def perform_switch(hold_seconds: float | None = None) -> dict:
         try:
             with conn.transaction():
                 cur = conn.cursor()
+
+                # 与合并互斥：合并持共享 advisory lock 时这里立即失败（不排队），
+                # 即“合并必须完整先于切换，否则拒绝”。拿到排他锁后，任何合并
+                # 的共享锁尝试都会立即被拒绝，切换的校验不会读到半次合并。
+                cur.execute("SELECT pg_try_advisory_xact_lock(%s) AS got",
+                            (MERGE_LOCK_KEY,))
+                if not cur.fetchone()[0]:
+                    raise RuntimeError(
+                        "a sample merge or another switch is in progress; "
+                        "switch refused (retry after it finishes)"
+                    )
+
+                # 在锁内重新确认阶段：并发切换/合并可能已改变状态
+                cur.execute("SELECT state FROM migration_state WHERE id=1 FOR UPDATE")
+                locked_phase = cur.fetchone()[0]
+                if locked_phase == "switched":
+                    raise _AlreadySwitched
+                if locked_phase != "ready":
+                    raise RuntimeError(
+                        f"switch requires phase 'ready', got '{locked_phase}'")
+
                 _set_state(cur, "switching", message="switch in progress")
 
                 # 唯一的写阻塞窗口：等待所有在途 DML 提交后取排他锁
@@ -328,13 +384,26 @@ def perform_switch(hold_seconds: float | None = None) -> dict:
                     raise RuntimeError("simulated crash during switch (rollback)")
             conn.commit()
             return {"ok": True, "detail": "switched: samples is now a view"}
+        except _AlreadySwitched:
+            conn.rollback()
+            return {"ok": True, "detail": "already switched"}
         except Exception as exc:
             conn.rollback()
-            # 回滚后恢复为 ready，旧表/双写触发器原样可用，可再次发起切换
+            # 回滚后恢复为 ready，旧表/双写触发器原样可用，可再次发起切换。
+            # 条件更新：若另一并发切换已经成功把状态置为 switched，不得覆盖它。
             with conn.transaction():
-                _set_state(conn.cursor(), "ready",
-                           message=f"switch rolled back: {exc!r}")
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE migration_state SET state='ready', message=%s, "
+                    "updated_at=now() WHERE id=1 AND state='switching'",
+                    (f"switch rolled back: {exc!r}",),
+                )
+                restored = cur.rowcount > 0
             conn.commit()
+            if not restored:
+                phase = get_phase(conn)
+                if phase == "switched":
+                    return {"ok": True, "detail": "already switched"}
             return {"ok": False,
                     "detail": f"switch rolled back, old interface intact: {exc!r}"}
     finally:
